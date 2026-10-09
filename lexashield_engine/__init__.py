@@ -2,9 +2,10 @@
 LexaShield Engine SDK
 
 SDK for building LexaShield processing engines.
+Engines produce the analysis JSON; the backend generates PDF reports.
 """
 
-__version__ = "1.0.0"
+from ._version import __version__
 
 from .server import BaseEngine, ProcessingContext
 from .connector import AsyncBackendConnector

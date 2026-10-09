@@ -16,6 +16,18 @@ Required environment variables (set by the caller before importing):
     AWS_DEFAULT_REGION          (default: us-east-1)
     S3_RESULTS_FOLDER           (default: results)
     SQS_VISIBILITY_TIMEOUT      Seconds (default: 300)
+
+The worker stores the analysis JSON only; the backend generates PDFs.
+
+Timings in worker_completion metadata (ms):
+    processing_time_ms     law pack download + analysis
+    analysis_time_ms       process_query / process_file
+    law_pack_download_ms
+    input_download_ms      file jobs only, else 0
+    result_upload_ms       metadata enrichment + JSON upload
+    engine_job_ms          whole job
+    model_load_time_ms     model load at container start
+Also pdf_generation ("on_demand") and sdk_version.
 """
 
 import asyncio
@@ -29,7 +41,16 @@ from typing import Any, Dict, List, Optional, Callable, Awaitable
 
 import boto3
 
+from ._version import __version__ as SDK_VERSION
 from .output import extract_compliance_signature_for_task_metadata
+
+# Written to task metadata: the engine does not generate the PDF.
+PDF_GENERATION_MODE = "on_demand"
+
+
+def _elapsed_ms(started: float) -> int:
+    """Milliseconds since a time.monotonic() reading."""
+    return int((time.monotonic() - started) * 1000)
 
 
 class SQSWorker:
@@ -43,10 +64,10 @@ class SQSWorker:
          ``on_startup`` returns (see ``run()``).
       3. Poll the engine-specific SQS queue continuously.
       4. For each message:
-           - Download law pack JSONL files from presigned S3 URLs.
+           - Download law pack JSONL files from S3.
            - Run inference via sdk.process_query / sdk.process_file.
            - Save result JSON to S3.
-           - Send worker_completion to the backend SQS queue.
+           - Send worker_completion, with timings, to the backend SQS queue.
            - Delete the engine queue message only after success.
       5. On job failure: send worker_completion(status=failed),
          do NOT delete — SQS retries / DLQ handles it.
@@ -160,12 +181,14 @@ class SQSWorker:
         language: Optional[str] = body.get("lang")
 
         t_start = time.monotonic()
+        input_download_ms = 0
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
 
             # Download law pack JSONL files from S3 using boto3 credentials.
             # Using the s3_key directly avoids presigned-URL expiry issues.
+            t_phase = time.monotonic()
             local_law_pack_paths: List[Path] = []
             for lp in law_pack_files_meta:
                 filename = lp["filename"]
@@ -179,6 +202,7 @@ class SQSWorker:
                     '{"event": "law_pack_downloaded", "taskId": "%s", "filename": "%s", "s3Key": "%s"}',
                     task_id, filename, s3_law_pack_key,
                 )
+            law_pack_download_ms = _elapsed_ms(t_phase)
 
             async def _publish_progress(percent: int, message: str = "") -> None:
                 progress_payload = {
@@ -205,20 +229,28 @@ class SQSWorker:
             )
 
             if input_type == "query":
+                t_phase = time.monotonic()
                 results, metadata = await sdk.process_query(ctx, body["input_query"])
+                analysis_time_ms = _elapsed_ms(t_phase)
 
             elif input_type == "file":
                 s3_key: str = body["input_file_s3_key"]
                 local_input = tmp / (body.get("input_file_name") or "input_file")
+                t_phase = time.monotonic()
                 await asyncio.to_thread(
                     s3_client.download_file, s3_bucket, s3_key, str(local_input)
                 )
+                input_download_ms = _elapsed_ms(t_phase)
+                t_phase = time.monotonic()
                 results, metadata = await sdk.process_file(ctx, str(local_input))
+                analysis_time_ms = _elapsed_ms(t_phase)
 
             else:
                 raise ValueError(f"Unknown input_type: {input_type!r}")
 
-            processing_time_ms = int((time.monotonic() - t_start) * 1000)
+            # Keep this measurement point: reports compare it with SDK 2.x jobs.
+            processing_time_ms = _elapsed_ms(t_start)
+            t_phase = time.monotonic()
 
             # Enrich output in-place: sets Analysis ID = task_id, Report Generated on,
             # and overrides engine/library metadata with authoritative backend values.
@@ -255,35 +287,7 @@ class SQSWorker:
                 '{"event": "json_saved", "taskId": "%s", "s3Key": "%s", "sizeBytes": %d}',
                 task_id, result_s3_key, len(result_json_bytes),
             )
-
-            # ── Generate and upload PDF result to S3 ──────────────────────────
-            result_pdf_s3_key: Optional[str] = None
-            try:
-                pdf_tmp_path = tmp / "result.pdf"
-                generated = await sdk._generate_pdf_from_output(results, pdf_tmp_path)
-                if generated and pdf_tmp_path.exists() and pdf_tmp_path.stat().st_size > 0:
-                    pdf_s3_key = f"{results_folder}/{task_id}/result.pdf"
-                    with open(pdf_tmp_path, "rb") as fh:
-                        pdf_bytes = fh.read()
-                    await asyncio.to_thread(
-                        lambda: s3_client.put_object(
-                            Bucket=s3_bucket,
-                            Key=pdf_s3_key,
-                            Body=pdf_bytes,
-                            ContentType="application/pdf",
-                            Metadata={"task_id": task_id, "engine_type": self.engine_type},
-                        )
-                    )
-                    result_pdf_s3_key = pdf_s3_key
-                    self.logger.info(
-                        '{"event": "pdf_saved", "taskId": "%s", "s3Key": "%s", "sizeBytes": %d}',
-                        task_id, pdf_s3_key, len(pdf_bytes),
-                    )
-            except Exception as pdf_err:
-                self.logger.warning(
-                    '{"event": "pdf_generation_failed", "taskId": "%s", "error": "%s"}',
-                    task_id, str(pdf_err).replace('"', "'"),
-                )
+            result_upload_ms = _elapsed_ms(t_phase)
 
         return {
             "message_type": "worker_completion",
@@ -291,12 +295,18 @@ class SQSWorker:
             "task_db_id": task_db_id,
             "status": "completed",
             "result_json_s3_key": result_s3_key,
-            "result_pdf_s3_key": result_pdf_s3_key,
             "metadata": {
                 **metadata,
                 "model_load_time_ms": model_load_time_ms,
                 "processing_time_ms": processing_time_ms,
+                "analysis_time_ms": analysis_time_ms,
+                "law_pack_download_ms": law_pack_download_ms,
+                "input_download_ms": input_download_ms,
+                "result_upload_ms": result_upload_ms,
+                "engine_job_ms": _elapsed_ms(t_start),
+                "pdf_generation": PDF_GENERATION_MODE,
                 "engine_type": self.engine_type,
+                "sdk_version": SDK_VERSION,
             },
         }
 
@@ -419,9 +429,12 @@ class SQSWorker:
 
                         self.logger.info(
                             '{"event": "job_completed", "taskId": "%s", "messageId": "%s", '
-                            '"processingTimeMs": %d, "modelLoadTimeMs": %d}',
+                            '"processingTimeMs": %d, "analysisTimeMs": %d, "engineJobMs": %d, '
+                            '"modelLoadTimeMs": %d}',
                             task_id, message_id,
                             completion["metadata"]["processing_time_ms"],
+                            completion["metadata"]["analysis_time_ms"],
+                            completion["metadata"]["engine_job_ms"],
                             model_load_time_ms,
                         )
 

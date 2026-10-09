@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lexashield-engine-sdk"
-version = "2.0.6"
+version = "3.0.0"
 description = "SDK for building LexaShield processing engines"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -32,8 +32,6 @@ dependencies = [
     "aiohttp>=3.13.5",
     "python-multipart>=0.0.27",
     "tenacity>=9.1.4",
-    "pyhtml2pdf>=0.1.0",
-    "pypdf>=6.10.2",
     "boto3==1.43.2",
 ]
 
@@ -49,9 +47,3 @@ dev = [
 [project.scripts]
 lexashield-engine = "lexashield_engine.cli:main"
 
-[tool.setuptools.package-data]
-lexashield_engine = [
-    "pdf_assets/*.pdf",
-    "pdf_assets/*.png",
-    "pdf_assets/*.css",
-]

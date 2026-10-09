@@ -26,6 +26,24 @@ Each engine container:
 4. For each job: runs inference with the already-loaded models, saves the result JSON to S3, sends a `worker_completion` message to the backend queue, then deletes the engine queue message.
 5. On failure: notifies the backend but does **not** delete the message — SQS retries / DLQ handles it.
 
+Engines do not generate PDF reports. The backend generates them from `results/{task_id}/result.json` on download.
+
+### Timing metrics
+
+Each `worker_completion` includes timings in `metadata` (milliseconds), reported by `GET /api/pa/engines/performance`.
+
+| Field | Meaning |
+|---|---|
+| `processing_time_ms` | Law pack download + analysis |
+| `analysis_time_ms` | `process_query` / `process_file` only |
+| `law_pack_download_ms` | Law pack JSONL downloads from S3 |
+| `input_download_ms` | Input document download from S3 (file jobs, else 0) |
+| `result_upload_ms` | Report metadata enrichment + JSON serialisation + S3 upload |
+| `engine_job_ms` | Whole job, from message pick-up to completion being ready |
+| `model_load_time_ms` | One-off model load at container start |
+| `pdf_generation` | Always `"on_demand"` |
+| `sdk_version` | SDK version that ran the job |
+
 ---
 
 ## Minimal example

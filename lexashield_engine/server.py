@@ -801,7 +801,7 @@ class BaseEngine(ABC):
         """
         Return True if the output contains at least one flag result (so we generate files).
         Kept for analytics/branching, but file generation now proceeds even when False
-        so users can still download JSON/PDF with the no-flag explanation pages.
+        so users can still download the report (with the no-flag explanation pages).
         """
         output_dict = None
         if isinstance(results, list) and len(results) > 0:
@@ -823,9 +823,7 @@ class BaseEngine(ABC):
 
     async def _generate_result_files(self, task_id: str, results: Any, ctx: ProcessingContext) -> Dict[str, str]:
         """
-        Generate result files and return URLs.
-        Files are generated even when there are no flag results, so the backend can expose
-        downloadable JSON/PDF that includes the no-flag explanation section.
+        Generate the result JSON, even with no flags, and return its URL.
         """
         # Use task_id as Analysis ID and set Report Generated on (in place)
         self._enrich_output_with_report_metadata(
@@ -847,15 +845,6 @@ class BaseEngine(ABC):
         json_path = result_dir / "result.json"
         json_path.write_text(json_content, encoding='utf-8')
         result_urls["json_url"] = f"/api/results/{task_id}/result.json"
-
-        # Generate PDF from complete output structure (if available)
-        try:
-            pdf_path = await self._generate_pdf_from_output(results, result_dir / "result.pdf")
-            if pdf_path and pdf_path.exists():
-                result_urls["pdf_url"] = f"/api/results/{task_id}/result.pdf"
-                logger.info(f"Generated PDF result for task {task_id}")
-        except Exception as e:
-            logger.warning(f"Failed to generate PDF for task {task_id}: {str(e)}")
 
         return result_urls
 
@@ -919,7 +908,7 @@ class BaseEngine(ABC):
     
     def _remove_definitions_from_output(self, results: Any) -> Any:
         """
-        Remove Definitions from output structure (used for JSON/backend, not PDF)
+        Remove Definitions from the JSON output. The PDF renderer adds them.
         
         Args:
             results: Processing results (list or dict)
@@ -942,50 +931,6 @@ class BaseEngine(ABC):
                     cleaned_list.append(item)
             return cleaned_list
         return results
-    
-    async def _generate_pdf_from_output(self, results: Any, pdf_path: Path) -> Optional[Path]:
-        """
-        Generate PDF file from engine output using template-based PDF generator
-        
-        Args:
-            results: Processing results (list or dict containing complete output structure)
-            pdf_path: Path where PDF should be saved
-            
-        Returns:
-            Path to generated PDF file, or None if generation failed or not applicable
-        """
-        try:
-            from .pdf_generator import generate_pdf_from_output
-            
-            output_dict = None
-            if isinstance(results, list) and len(results) > 0:
-                # Check if first item is a dict with "Report Metadata" or "Results"
-                first_item = results[0]
-                if isinstance(first_item, dict) and ("Report Metadata" in first_item or "Results" in first_item):
-                    output_dict = first_item
-            elif isinstance(results, dict):
-                # Check if it's a complete output structure
-                if "Report Metadata" in results or "Results" in results:
-                    output_dict = results
-            
-            if output_dict is None:
-                logger.debug("Results do not contain complete output structure, skipping PDF generation")
-                return None
-            
-            generate_pdf_from_output(
-                output=output_dict,
-                output_path=pdf_path
-            )
-            
-            logger.info(f"Generated PDF: {pdf_path} ({pdf_path.stat().st_size} bytes)")
-            return pdf_path
-            
-        except ImportError as e:
-            logger.warning(f"PDF generation not available (install pyhtml2pdf): {e}")
-            return None
-        except Exception as e:
-            logger.warning(f"PDF generation failed: {e}", exc_info=True)
-            return None
     
     # =========================================================================
     # ABSTRACT METHODS (Must be implemented by subclasses)

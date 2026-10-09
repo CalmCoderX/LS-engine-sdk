@@ -14,20 +14,13 @@ long_description = (this_directory / "README.md").read_text(encoding='utf-8')
 
 setup(
     name="lexashield-engine-sdk",
-    version="2.0.6",
+    version="3.0.0",
     author="LexaShield Team",
     author_email="prashant@lexashield.com",
     description="SDK for building LexaShield processing engines",
     long_description=long_description,
     long_description_content_type="text/markdown",
     packages=find_packages(),
-    package_data={
-        "lexashield_engine": [
-            "pdf_assets/*.pdf",
-            "pdf_assets/*.png",
-            "pdf_assets/*.css",
-        ],
-    },
     include_package_data=True,
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -48,8 +41,6 @@ setup(
         "aiohttp>=3.13.5",
         "python-multipart>=0.0.27",
         "tenacity>=9.1.4",
-        "pyhtml2pdf>=0.1.0",
-        "pypdf>=6.10.2",
         "boto3==1.43.2",
     ],
     extras_require={
