@@ -1,33 +1,23 @@
 """
-SQSWorker — shared ECS/Fargate worker loop for all Lexa engine types.
+SQS worker loop shared by all engines.
 
-Each engine's worker.py sets the model-cache env vars, instantiates its own SDK
-class, then hands control to this class:
-
-    sdk = LawEngineSDK()
-    worker = SQSWorker(engine_type="law", queue_env_var="SQS_LAW_QUEUE_URL")
-    asyncio.run(worker.run(sdk))
-
-Required environment variables (set by the caller before importing):
-    SENTENCE_TRANSFORMERS_HOME  Model cache directory     (default: /app/models)
-    SQS_<ENGINE>_QUEUE_URL      Engine-specific SQS queue (name passed via queue_env_var)
-    SQS_TASK_QUEUE_URL          Backend main queue (worker completion messages)
-    S3_BUCKET_NAME              Result storage bucket
+Environment variables:
+    SENTENCE_TRANSFORMERS_HOME  Model directory (default: /app/models)
+    SQS_<ENGINE>_QUEUE_URL      Engine queue (name passed as queue_env_var)
+    SQS_TASK_QUEUE_URL          Backend queue
+    S3_BUCKET_NAME              Result bucket
     AWS_DEFAULT_REGION          (default: us-east-1)
     S3_RESULTS_FOLDER           (default: results)
     SQS_VISIBILITY_TIMEOUT      Seconds (default: 300)
 
-The worker stores the analysis JSON only; the backend generates PDFs.
-
 Timings in worker_completion metadata (ms):
-    processing_time_ms     law pack download + analysis
     analysis_time_ms       process_query / process_file
     law_pack_download_ms
     input_download_ms      file jobs only, else 0
     result_upload_ms       metadata enrichment + JSON upload
     engine_job_ms          whole job
     model_load_time_ms     model load at container start
-Also pdf_generation ("on_demand") and sdk_version.
+Also engine_type and sdk_version.
 """
 
 import asyncio
@@ -37,15 +27,13 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Callable, Awaitable
+from typing import Any, Dict, List, Optional
 
 import boto3
 
 from ._version import __version__ as SDK_VERSION
+from .engine import ProcessingContext
 from .output import extract_compliance_signature_for_task_metadata
-
-# Written to task metadata: the engine does not generate the PDF.
-PDF_GENERATION_MODE = "on_demand"
 
 
 def _elapsed_ms(started: float) -> int:
@@ -55,22 +43,8 @@ def _elapsed_ms(started: float) -> int:
 
 class SQSWorker:
     """
-    Generic SQS polling loop shared by all engine worker containers.
-
-        Lifecycle (called by run()):
-      1. Validate local model directory — fail fast if missing or empty.
-      2. Call sdk.on_startup() to load all inference dependencies into memory (once).
-         Engines must complete heavy setup here; ``worker_ready`` is logged only after
-         ``on_startup`` returns (see ``run()``).
-      3. Poll the engine-specific SQS queue continuously.
-      4. For each message:
-           - Download law pack JSONL files from S3.
-           - Run inference via sdk.process_query / sdk.process_file.
-           - Save result JSON to S3.
-           - Send worker_completion, with timings, to the backend SQS queue.
-           - Delete the engine queue message only after success.
-      5. On job failure: send worker_completion(status=failed),
-         do NOT delete — SQS retries / DLQ handles it.
+    Polls the engine queue and runs each job.
+    A failed job is reported to the backend and left on the queue for retry.
     """
 
     def __init__(
@@ -80,17 +54,12 @@ class SQSWorker:
         logger_name: Optional[str] = None,
     ) -> None:
         """
-        Args:
-            engine_type:   'law' | 'iso' | 'standard'  (used in logs and metadata)
-            queue_env_var: Name of the env var that holds the engine SQS queue URL,
-                           e.g. 'SQS_LAW_QUEUE_URL'
-            logger_name:   Optional override for the Python logger name.
+        engine_type: 'law', 'iso' or 'standard'.
+        queue_env_var: env var holding the engine queue URL, e.g. 'SQS_LAW_QUEUE_URL'.
         """
         self.engine_type = engine_type
         self.queue_env_var = queue_env_var
         self.logger = logging.getLogger(logger_name or f"{engine_type}_worker")
-
-    # ── Model cache validation ────────────────────────────────────────────────
 
     def _validate_model_directory(self, model_dir: str) -> None:
         """Fail fast if the model directory is missing or empty."""
@@ -111,48 +80,6 @@ class SQSWorker:
             model_dir, len(items),
         )
 
-    # ── Context stub ──────────────────────────────────────────────────────────
-
-    class _WorkerContext:
-        """
-        Duck-typed replacement for lexashield_engine.ProcessingContext.
-        Satisfies the interface the engine SDK calls without an HTTP layer.
-        """
-        def __init__(
-            self,
-            task_id: str,
-            task_db_id: int,
-            law_pack_file_paths: List[Path],
-            title: str = "",
-            language: Optional[str] = None,
-            progress_publisher: Optional[Callable[[int, str], Awaitable[None]]] = None,
-        ) -> None:
-            self.task_id = task_id
-            self.task_db_id = task_db_id
-            self.law_pack_file_paths = [Path(p) for p in law_pack_file_paths]
-            self.title = title
-            self.language = language
-            self._progress_publisher = progress_publisher
-            self._started = time.monotonic()
-
-        @property
-        def elapsed_seconds(self) -> float:
-            return time.monotonic() - self._started
-
-        async def update_progress(self, percent: int, message: str = "") -> None:
-            # Progress is logged; live DB updates are handled by the
-            # recovery job on the backend side.
-            logging.getLogger("worker_context").info(
-                '{"event": "progress", "taskId": "%s", "percent": %d, "message": "%s"}',
-                self.task_id,
-                percent,
-                str(message).replace('"', "'"),
-            )
-            if self._progress_publisher is not None:
-                await self._progress_publisher(percent, message)
-
-    # ── Job processing ────────────────────────────────────────────────────────
-
     @staticmethod
     def _download_s3_file(s3_client: Any, bucket: str, key: str, dest: Path) -> None:
         s3_client.download_file(bucket, key, str(dest))
@@ -168,11 +95,7 @@ class SQSWorker:
         results_folder: str,
         model_load_time_ms: int,
     ) -> Dict[str, Any]:
-        """
-        Execute one job from SQS.  Returns the completion payload dict.
-        Raises on unrecoverable errors so the caller can decide whether to
-        delete the SQS message or leave it for retry / DLQ.
-        """
+        """Run one job and return the worker_completion payload. Raises on failure."""
         task_id: str = body["task_id"]
         task_db_id: int = body["task_db_id"]
         input_type: str = body["input_type"]
@@ -186,8 +109,7 @@ class SQSWorker:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
 
-            # Download law pack JSONL files from S3 using boto3 credentials.
-            # Using the s3_key directly avoids presigned-URL expiry issues.
+            # Download by S3 key; presigned URLs can expire.
             t_phase = time.monotonic()
             local_law_pack_paths: List[Path] = []
             for lp in law_pack_files_meta:
@@ -219,9 +141,8 @@ class SQSWorker:
                     MessageBody=json.dumps(progress_payload, default=str),
                 )
 
-            ctx = self._WorkerContext(
+            ctx = ProcessingContext(
                 task_id,
-                task_db_id,
                 local_law_pack_paths,
                 title,
                 language,
@@ -248,13 +169,8 @@ class SQSWorker:
             else:
                 raise ValueError(f"Unknown input_type: {input_type!r}")
 
-            # Keep this measurement point: reports compare it with SDK 2.x jobs.
-            processing_time_ms = _elapsed_ms(t_start)
             t_phase = time.monotonic()
 
-            # Enrich output in-place: sets Analysis ID = task_id, Report Generated on,
-            # and overrides engine/library metadata with authoritative backend values.
-            # Mirrors what BaseEngine._generate_result_files does in the HTTP path.
             sdk._enrich_output_with_report_metadata(
                 results,
                 task_id,
@@ -270,7 +186,6 @@ class SQSWorker:
             if sig:
                 metadata["Compliance Signature"] = sig
 
-            # ── Upload JSON result to S3 ───────────────────────────────────────
             result_json_bytes = sdk._generate_json_result(results).encode("utf-8")
             result_s3_key = f"{results_folder}/{task_id}/result.json"
 
@@ -298,31 +213,20 @@ class SQSWorker:
             "metadata": {
                 **metadata,
                 "model_load_time_ms": model_load_time_ms,
-                "processing_time_ms": processing_time_ms,
                 "analysis_time_ms": analysis_time_ms,
                 "law_pack_download_ms": law_pack_download_ms,
                 "input_download_ms": input_download_ms,
                 "result_upload_ms": result_upload_ms,
                 "engine_job_ms": _elapsed_ms(t_start),
-                "pdf_generation": PDF_GENERATION_MODE,
                 "engine_type": self.engine_type,
                 "sdk_version": SDK_VERSION,
             },
         }
 
-    # ── Main run loop ─────────────────────────────────────────────────────────
-
     async def run(self, sdk: Any) -> None:
         """
-        Validate model cache, load models via sdk.on_startup(), then poll SQS forever.
-        Blocks until the process is killed (normal ECS behaviour).
-
-        Args:
-            sdk: An instantiated engine SDK object (LawEngineSDK, ISO9001EngineSDK,
-                 StandardEngineSDK, …) that exposes on_startup(),
-                 process_query(), and process_file(). Implementations should load every
-                 model or library used by those handlers inside on_startup so the
-                 ``worker_ready`` log line reflects a fully warm worker.
+        Load models with sdk.on_startup(), then poll SQS until the container stops.
+        on_startup() should load everything the handlers use, so worker_ready means warm.
         """
         model_dir: str = os.environ.get("SENTENCE_TRANSFORMERS_HOME", "/app/models")
         queue_url: Optional[str] = os.environ.get(self.queue_env_var)
@@ -349,10 +253,8 @@ class SQSWorker:
             '{"event": "worker_starting", "engineType": "%s"}', self.engine_type
         )
 
-        # ── Step 1: validate model cache directory ────────────────────────────
         self._validate_model_directory(model_dir)
 
-        # ── Step 2: load models from local cache (once) ───────────────────────
         self.logger.info(
             '{"event": "loading_models", "modelDir": "%s"}', model_dir
         )
@@ -364,7 +266,6 @@ class SQSWorker:
             model_dir, model_load_time_ms,
         )
 
-        # ── Step 3: AWS clients ───────────────────────────────────────────────
         sqs = boto3.client("sqs", region_name=aws_region)
         s3 = boto3.client("s3", region_name=aws_region)
 
@@ -373,7 +274,6 @@ class SQSWorker:
             self.engine_type, queue_url,
         )
 
-        # ── Step 4: poll SQS ──────────────────────────────────────────────────
         while True:
             try:
                 response = await asyncio.to_thread(
@@ -429,10 +329,8 @@ class SQSWorker:
 
                         self.logger.info(
                             '{"event": "job_completed", "taskId": "%s", "messageId": "%s", '
-                            '"processingTimeMs": %d, "analysisTimeMs": %d, "engineJobMs": %d, '
-                            '"modelLoadTimeMs": %d}',
+                            '"analysisTimeMs": %d, "engineJobMs": %d, "modelLoadTimeMs": %d}',
                             task_id, message_id,
-                            completion["metadata"]["processing_time_ms"],
                             completion["metadata"]["analysis_time_ms"],
                             completion["metadata"]["engine_job_ms"],
                             model_load_time_ms,
@@ -465,7 +363,7 @@ class SQSWorker:
                                 '"error": "%s"}',
                                 task_id, str(notify_err),
                             )
-                        # Do NOT delete — let SQS visibility timeout expire for retry / DLQ.
+                        # Keep the message: SQS retries it or moves it to the DLQ.
 
             except Exception as outer_exc:
                 self.logger.error(

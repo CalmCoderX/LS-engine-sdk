@@ -1,8 +1,6 @@
 # LexaShield Engine SDK
 
-SDK for building LexaShield processing engines. Engines run as ECS/Fargate SQS workers — each container loads ML models from EFS once into memory and processes many jobs without reloading.
-
----
+Base class and SQS worker for LexaShield analysis engines. Each engine runs as an ECS/Fargate container that loads its models once and processes jobs from its SQS queue.
 
 ## Installation
 
@@ -14,41 +12,36 @@ venv\Scripts\activate          # Windows
 pip install -e .
 ```
 
----
-
 ## How it works
 
 Each engine container:
 
-1. Validates that the EFS model directory exists and is non-empty.
-2. Calls `on_startup()` to load ML models from EFS into memory (once per container lifetime).
-3. Polls an engine-specific SQS queue continuously.
-4. For each job: runs inference with the already-loaded models, saves the result JSON to S3, sends a `worker_completion` message to the backend queue, then deletes the engine queue message.
-5. On failure: notifies the backend but does **not** delete the message — SQS retries / DLQ handles it.
+1. Checks that the model directory exists and is not empty.
+2. Calls `on_startup()` to load models into memory.
+3. Polls its SQS queue.
+4. For each job: downloads the law pack files, runs `process_query()` or `process_file()`, saves `results/{task_id}/result.json` to S3, sends `worker_completion` to the backend queue, then deletes the job message.
+5. On failure: notifies the backend and leaves the message for SQS retry / DLQ.
 
-Engines do not generate PDF reports. The backend generates them from `results/{task_id}/result.json` on download.
+The backend generates PDF reports from `result.json` on download.
 
 ### Timing metrics
 
-Each `worker_completion` includes timings in `metadata` (milliseconds), reported by `GET /api/pa/engines/performance`.
+`worker_completion` metadata includes these timings (milliseconds), reported by `GET /api/pa/engines/performance`.
 
 | Field | Meaning |
 |---|---|
-| `processing_time_ms` | Law pack download + analysis |
-| `analysis_time_ms` | `process_query` / `process_file` only |
-| `law_pack_download_ms` | Law pack JSONL downloads from S3 |
-| `input_download_ms` | Input document download from S3 (file jobs, else 0) |
-| `result_upload_ms` | Report metadata enrichment + JSON serialisation + S3 upload |
-| `engine_job_ms` | Whole job, from message pick-up to completion being ready |
-| `model_load_time_ms` | One-off model load at container start |
-| `pdf_generation` | Always `"on_demand"` |
-| `sdk_version` | SDK version that ran the job |
+| `analysis_time_ms` | `process_query` / `process_file` |
+| `law_pack_download_ms` | Law pack downloads from S3 |
+| `input_download_ms` | Input file download from S3 (file jobs, else 0) |
+| `result_upload_ms` | Report metadata, JSON serialisation and S3 upload |
+| `engine_job_ms` | Whole job, from message pick-up to completion |
+| `model_load_time_ms` | Model load at container start |
 
----
+It also includes `engine_type` and `sdk_version`.
 
 ## Minimal example
 
-### worker.py (entry point)
+### worker.py
 
 ```python
 import asyncio, os
@@ -72,7 +65,6 @@ from lexashield_engine import BaseEngine, ProcessingContext
 class MyEngineSDK(BaseEngine):
 
     async def on_startup(self):
-        """Load ML models from EFS into memory — called once on container start."""
         self.model = load_my_model(os.environ["SENTENCE_TRANSFORMERS_HOME"])
 
     async def process_query(self, ctx: ProcessingContext, query: str) -> tuple:
@@ -81,74 +73,48 @@ class MyEngineSDK(BaseEngine):
         return [{"results": results}], {"input_type": "query"}
 
     async def process_file(self, ctx: ProcessingContext, file_path: str) -> tuple:
-        await ctx.update_progress(30, "Reading file...")
         with open(file_path) as f:
             content = f.read()
         results = self.model.encode(content)
         return [{"results": results}], {"input_type": "file"}
 ```
 
----
-
 ## Environment variables
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `SENTENCE_TRANSFORMERS_HOME` | Yes | `/mnt/models` | EFS model directory (local cache for dev) |
-| `HF_HOME` | Yes | `/mnt/models` | HuggingFace cache dir — set same as above |
-| `TRANSFORMERS_CACHE` | Yes | `/mnt/models` | Transformers cache dir — set same as above |
-| `SQS_<ENGINE>_QUEUE_URL` | Yes | — | Engine-specific SQS queue URL |
-| `SQS_TASK_QUEUE_URL` | Yes | — | Backend completion queue URL |
-| `S3_BUCKET_NAME` | Yes | — | S3 bucket for result storage |
+| `SQS_<ENGINE>_QUEUE_URL` | Yes | — | Engine SQS queue URL |
+| `SQS_TASK_QUEUE_URL` | Yes | — | Backend queue URL |
+| `S3_BUCKET_NAME` | Yes | — | Result bucket |
+| `SENTENCE_TRANSFORMERS_HOME` | No | `/app/models` | Model directory |
 | `S3_RESULTS_FOLDER` | No | `results` | S3 key prefix for results |
-| `SQS_VISIBILITY_TIMEOUT` | No | `300` | Seconds to hide a message during processing |
+| `SQS_VISIBILITY_TIMEOUT` | No | `300` | Seconds a job stays hidden while processing |
 | `AWS_DEFAULT_REGION` | No | `us-east-1` | AWS region |
 | `LOG_LEVEL` | No | `INFO` | Logging level |
+| `LOG_FILE` | No | `~/lexashield/logs/engine.log` | Log file |
+| `LOG_TO_CONSOLE` | No | `true` | Also log to the console |
 
-Set these in the engine's `.env` for local development. In production they come from the ECS task definition.
-
----
+Use the engine's `.env` for local development. In production they come from the ECS task definition.
 
 ## ProcessingContext
 
-Passed to `process_query` and `process_file` by the worker.
-
 | Attribute / Method | Description |
 |---|---|
-| `ctx.task_id` | Unique task identifier |
-| `ctx.law_pack_file_paths` | `List[Path]` — downloaded law pack JSONL files |
-| `ctx.title` | Report/document title from the platform |
-| `ctx.elapsed_seconds` | Seconds since processing started |
-| `await ctx.update_progress(percent, message)` | Logs progress to stdout |
+| `ctx.task_id` | Task ID |
+| `ctx.law_pack_file_paths` | `List[Path]` of downloaded law pack files |
+| `ctx.title` | Report title from the platform |
+| `ctx.language` | Language selected on the platform |
+| `ctx.elapsed_seconds` | Seconds since the job started |
+| `await ctx.update_progress(percent, message)` | Logs progress and sends it to the backend |
 
----
-
-## SQSWorker reference
+## SQSWorker
 
 ```python
 SQSWorker(
-    engine_type: str,       # 'law' | 'iso' | 'standard' — used in logs
-    queue_env_var: str,     # name of the env var holding the engine queue URL
+    engine_type: str,       # 'law' | 'iso' | 'standard'
+    queue_env_var: str,     # env var holding the engine queue URL
     logger_name: str = None
 )
 
-await worker.run(sdk)       # blocks forever — ECS restarts the container on exit
+await worker.run(sdk)       # runs until the container stops
 ```
-
----
-
-## Local development
-
-Download all ML models to a local directory before running an engine locally:
-
-```bash
-python scripts/seed_local_models.py
-
-# Target a specific directory:
-python scripts/seed_local_models.py --dir C:\Users\you\.cache\lexa-models
-
-# Single engine only:
-python scripts/seed_local_models.py --engines law
-```
-
-Then set `SENTENCE_TRANSFORMERS_HOME`, `HF_HOME`, and `TRANSFORMERS_CACHE` in the engine's `.env` to that directory.
